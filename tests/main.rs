@@ -5,7 +5,7 @@ use datafusion_common::ScalarValue;
 mod utils;
 use datafusion_expr::ColumnarValue;
 use datafusion_functions_json::udfs::json_get_str_udf;
-use utils::{display_val, run_query, run_query_large, run_query_params};
+use utils::{display_val, logical_plan, run_query, run_query_large, run_query_params};
 
 #[tokio::test]
 async fn test_json_contains() {
@@ -362,7 +362,7 @@ async fn test_json_length_object_nested() {
 async fn test_json_contains_large() {
     let expected = [
         "+----------+",
-        "| COUNT(*) |",
+        "| count(*) |",
         "+----------+",
         "| 4        |",
         "+----------+",
@@ -378,7 +378,7 @@ async fn test_json_contains_large() {
 async fn test_json_contains_large_vec() {
     let expected = [
         "+----------+",
-        "| COUNT(*) |",
+        "| count(*) |",
         "+----------+",
         "| 0        |",
         "+----------+",
@@ -394,7 +394,7 @@ async fn test_json_contains_large_vec() {
 async fn test_json_contains_large_both() {
     let expected = [
         "+----------+",
-        "| COUNT(*) |",
+        "| count(*) |",
         "+----------+",
         "| 0        |",
         "+----------+",
@@ -410,7 +410,7 @@ async fn test_json_contains_large_both() {
 async fn test_json_contains_large_params() {
     let expected = [
         "+----------+",
-        "| COUNT(*) |",
+        "| count(*) |",
         "+----------+",
         "| 4        |",
         "+----------+",
@@ -426,7 +426,7 @@ async fn test_json_contains_large_params() {
 async fn test_json_contains_large_both_params() {
     let expected = [
         "+----------+",
-        "| COUNT(*) |",
+        "| count(*) |",
         "+----------+",
         "| 4        |",
         "+----------+",
@@ -523,7 +523,7 @@ async fn test_json_get_union_scalar() {
 }
 
 #[tokio::test]
-async fn test_json_get_union_array() {
+async fn test_json_get_nested_collapsed() {
     let expected = [
         "+------------------+---------+",
         "| name             | v       |",
@@ -545,6 +545,68 @@ async fn test_json_get_union_array() {
 }
 
 #[tokio::test]
+async fn test_json_get_unnest_plan() {
+    let plan_lines = logical_plan("explain select json_get(json_get(json_data, 'foo'), 0) v from test").await;
+
+    let expected = [
+        "Projection: json_get(test.json_data, Utf8(\"foo\"), Int64(0)) AS v",
+        "  TableScan: test projection=[json_data]",
+    ];
+
+    assert_eq!(plan_lines, expected);
+}
+
+#[tokio::test]
+async fn test_json_get_nested_cte() {
+    let expected = [
+        "+------------------+---------+",
+        "| name             | v       |",
+        "+------------------+---------+",
+        "| object_foo       | {null=} |",
+        "| object_foo_array | {int=1} |",
+        "| object_foo_obj   | {null=} |",
+        "| object_foo_null  | {null=} |",
+        "| object_bar       | {null=} |",
+        "| list_foo         | {null=} |",
+        "| invalid_json     | {null=} |",
+        "+------------------+---------+",
+    ];
+
+    // avoid auto-unnesting with a CTE
+    let sql = r#"
+        with t as (select name, json_get(json_data, 'foo') j from test)
+        select name, json_get(j, 0) v from t
+    "#;
+
+    let batches = run_query(sql).await.unwrap();
+    assert_batches_eq!(expected, &batches);
+}
+
+#[tokio::test]
+async fn test_json_get_union_array() {
+    let expected = [
+        "+------------------+---------+",
+        "| name             | v       |",
+        "+------------------+---------+",
+        "| object_foo       | {null=} |",
+        "| object_foo_array | {int=1} |",
+        "| object_foo_obj   | {null=} |",
+        "| object_foo_null  | {null=} |",
+        "| object_bar       | {null=} |",
+        "| list_foo         | {null=} |",
+        "| invalid_json     | {null=} |",
+        "+------------------+---------+",
+    ];
+
+    let sql = r#"
+    with t as (select name, json_get(json_data, 'foo') j from test)
+    select name, json_get(j, 0) v from t
+    "#;
+    let batches = run_query(sql).await.unwrap();
+    assert_batches_eq!(expected, &batches);
+}
+
+#[tokio::test]
 async fn test_json_get_union_array_skip() {
     let expected = [
         "+-------------+",
@@ -559,6 +621,29 @@ async fn test_json_get_union_array_skip() {
     let sql = "select json_get(json_get(json_data, str_key1), str_key2) v from more_nested";
     let batches = run_query(sql).await.unwrap();
     assert_batches_eq!(expected, &batches);
+}
+
+#[tokio::test]
+async fn test_multiple_column_lookups() {
+    let sql = "select json_get(json_data, str_key1, str_key2) v from more_nested";
+    let err = run_query(sql).await.unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "Execution error: More than 1 path element is not supported when querying JSON using an array."
+    );
+}
+
+#[tokio::test]
+async fn test_multiple_column_lookups_not_rewritten() {
+    let sql = "explain select json_get(json_get(json_data, str_key1), str_key2) v from more_nested";
+    let plan_lines = logical_plan(sql).await;
+
+    let expected = [
+        "Projection: json_get(json_get(more_nested.json_data, more_nested.str_key1), more_nested.str_key2) AS v",
+        "  TableScan: more_nested projection=[json_data, str_key1, str_key2]",
+    ];
+
+    assert_eq!(plan_lines, expected);
 }
 
 #[tokio::test]
@@ -577,4 +662,204 @@ async fn test_json_get_union_array_skip_double_nested() {
         "select json_data, json_get_int(json_get(json_get(json_data, str_key1), str_key2), int_key) v from more_nested";
     let batches = run_query(sql).await.unwrap();
     assert_batches_eq!(expected, &batches);
+}
+
+#[tokio::test]
+async fn test_question_mark_contains() {
+    let expected = [
+        "+------------------+------------------------------+",
+        "| name             | test.json_data ? Utf8(\"foo\") |",
+        "+------------------+------------------------------+",
+        "| object_foo       | true                         |",
+        "| object_foo_array | true                         |",
+        "| object_foo_obj   | true                         |",
+        "| object_foo_null  | true                         |",
+        "| object_bar       | false                        |",
+        "| list_foo         | false                        |",
+        "| invalid_json     | false                        |",
+        "+------------------+------------------------------+",
+    ];
+
+    let batches = run_query("select name, json_data ? 'foo' from test").await.unwrap();
+    assert_batches_eq!(expected, &batches);
+}
+
+#[tokio::test]
+async fn test_arrow() {
+    let batches = run_query("select name, json_data->'foo' from test").await.unwrap();
+
+    let expected = [
+        "+------------------+-------------------------------+",
+        "| name             | test.json_data -> Utf8(\"foo\") |",
+        "+------------------+-------------------------------+",
+        "| object_foo       | {str=abc}                     |",
+        "| object_foo_array | {array=[1]}                   |",
+        "| object_foo_obj   | {object={}}                   |",
+        "| object_foo_null  | {null=true}                   |",
+        "| object_bar       | {null=}                       |",
+        "| list_foo         | {null=}                       |",
+        "| invalid_json     | {null=}                       |",
+        "+------------------+-------------------------------+",
+    ];
+    assert_batches_eq!(expected, &batches);
+}
+
+#[tokio::test]
+async fn test_arrow_plan() {
+    let lines = logical_plan(r#"explain select json_data->'foo' from test"#).await;
+
+    let expected = [
+        "Projection: json_get(test.json_data, Utf8(\"foo\")) AS test.json_data -> Utf8(\"foo\")",
+        "  TableScan: test projection=[json_data]",
+    ];
+
+    assert_eq!(lines, expected);
+}
+
+#[tokio::test]
+async fn test_long_arrow() {
+    let batches = run_query("select name, json_data->>'foo' from test").await.unwrap();
+
+    let expected = [
+        "+------------------+--------------------------------+",
+        "| name             | test.json_data ->> Utf8(\"foo\") |",
+        "+------------------+--------------------------------+",
+        "| object_foo       | abc                            |",
+        "| object_foo_array |                                |",
+        "| object_foo_obj   |                                |",
+        "| object_foo_null  |                                |",
+        "| object_bar       |                                |",
+        "| list_foo         |                                |",
+        "| invalid_json     |                                |",
+        "+------------------+--------------------------------+",
+    ];
+    assert_batches_eq!(expected, &batches);
+}
+
+#[tokio::test]
+async fn test_long_arrow_plan() {
+    let lines = logical_plan(r#"explain select json_data->>'foo' from test"#).await;
+
+    let expected = [
+        "Projection: json_get_str(test.json_data, Utf8(\"foo\")) AS test.json_data ->> Utf8(\"foo\")",
+        "  TableScan: test projection=[json_data]",
+    ];
+
+    assert_eq!(lines, expected);
+}
+
+#[tokio::test]
+async fn test_long_arrow_cast_str() {
+    let batches = run_query(r"select name, (json_data->>'foo')='abc' from test")
+        .await
+        .unwrap();
+
+    let expected = [
+        "+------------------+----------------------------------------------+",
+        "| name             | test.json_data ->> Utf8(\"foo\") = Utf8(\"abc\") |",
+        "+------------------+----------------------------------------------+",
+        "| object_foo       | true                                         |",
+        "| object_foo_array |                                              |",
+        "| object_foo_obj   |                                              |",
+        "| object_foo_null  |                                              |",
+        "| object_bar       |                                              |",
+        "| list_foo         |                                              |",
+        "| invalid_json     |                                              |",
+        "+------------------+----------------------------------------------+",
+    ];
+    assert_batches_eq!(expected, &batches);
+}
+
+#[tokio::test]
+async fn test_long_arrow_cast_int() {
+    let sql = r#"select ('{"foo": 42}'->'foo')::int"#;
+    let batches = run_query(sql).await.unwrap();
+    assert_eq!(display_val(batches).await, (DataType::Int64, "42".to_string()));
+}
+
+#[tokio::test]
+async fn test_arrow_cast_plan() {
+    let lines = logical_plan(r#"explain select (json_data->'foo')::int from test"#).await;
+
+    let expected = [
+        "Projection: json_get_int(test.json_data, Utf8(\"foo\")) AS test.json_data -> Utf8(\"foo\")",
+        "  TableScan: test projection=[json_data]",
+    ];
+
+    assert_eq!(lines, expected);
+}
+
+#[tokio::test]
+async fn test_arrow_nested() {
+    let batches = run_query("select name, (json_data->'foo'->0)::int from test")
+        .await
+        .unwrap();
+
+    let expected = [
+        "+------------------+-------------------------------------------+",
+        "| name             | test.json_data -> Utf8(\"foo\") -> Int64(0) |",
+        "+------------------+-------------------------------------------+",
+        "| object_foo       |                                           |",
+        "| object_foo_array | 1                                         |",
+        "| object_foo_obj   |                                           |",
+        "| object_foo_null  |                                           |",
+        "| object_bar       |                                           |",
+        "| list_foo         |                                           |",
+        "| invalid_json     |                                           |",
+        "+------------------+-------------------------------------------+",
+    ];
+    assert_batches_eq!(expected, &batches);
+}
+
+#[tokio::test]
+async fn test_arrow_nested_plan() {
+    let lines = logical_plan(r#"explain select json_data->'foo'->0 from test"#).await;
+
+    let expected = [
+        "Projection: json_get(test.json_data, Utf8(\"foo\"), Int64(0)) AS test.json_data -> Utf8(\"foo\") -> Int64(0)",
+        "  TableScan: test projection=[json_data]",
+    ];
+
+    assert_eq!(lines, expected);
+}
+
+#[tokio::test]
+async fn test_arrow_nested_columns() {
+    let expected = [
+        "+-------------+",
+        "| v           |",
+        "+-------------+",
+        "| {array=[0]} |",
+        "| {null=}     |",
+        "| {null=true} |",
+        "+-------------+",
+    ];
+
+    let sql = "select json_data->str_key1->str_key2 v from more_nested";
+    let batches = run_query(sql).await.unwrap();
+    assert_batches_eq!(expected, &batches);
+}
+
+#[tokio::test]
+async fn test_arrow_nested_double_columns() {
+    let expected = [
+        "+---------+",
+        "| v       |",
+        "+---------+",
+        "| {int=0} |",
+        "| {null=} |",
+        "| {null=} |",
+        "+---------+",
+    ];
+
+    let sql = "select json_data->str_key1->str_key2->int_key v from more_nested";
+    let batches = run_query(sql).await.unwrap();
+    assert_batches_eq!(expected, &batches);
+}
+
+#[tokio::test]
+async fn test_lexical_precedence_wrong() {
+    let sql = r#"select '{"a": "b"}'->>'a'='b' as v"#;
+    let err = run_query(sql).await.unwrap_err();
+    assert_eq!(err.to_string(), "Error during planning: Unexpected argument type to 'LongArrow' at position 2, expected string or int, got Boolean.")
 }

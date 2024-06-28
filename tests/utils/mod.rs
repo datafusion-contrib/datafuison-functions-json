@@ -9,10 +9,12 @@ use arrow::{array::LargeStringArray, array::StringArray, record_batch::RecordBat
 use datafusion::error::Result;
 use datafusion::execution::context::SessionContext;
 use datafusion_common::ParamValues;
+use datafusion_execution::config::SessionConfig;
 use datafusion_functions_json::register_all;
 
 async fn create_test_table(large_utf8: bool) -> Result<SessionContext> {
-    let mut ctx = SessionContext::new();
+    let config = SessionConfig::new().set_str("datafusion.sql_parser.dialect", "postgres");
+    let mut ctx = SessionContext::new_with_config(config);
     register_all(&mut ctx)?;
 
     let test_data = [
@@ -141,4 +143,11 @@ pub async fn display_val(batch: Vec<RecordBatch>) -> (DataType, String) {
     let f = ArrayFormatter::try_new(c.as_ref(), &options).unwrap();
     let repr = f.value(0).try_to_string().unwrap();
     (schema_col.data_type().clone(), repr)
+}
+
+pub async fn logical_plan(sql: &str) -> Vec<String> {
+    let batches = run_query(sql).await.unwrap();
+    let plan_col = batches[0].column(1).as_any().downcast_ref::<StringArray>().unwrap();
+    let logical_plan = plan_col.value(0);
+    logical_plan.split('\n').map(|s| s.to_string()).collect()
 }
